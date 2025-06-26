@@ -1,0 +1,11 @@
+{
+  "watch": ["*.js", "*.json"],
+  "ignore": [
+    "backstop_data/**/*",
+    "uploads/**/*",
+    "node_modules/**/*",
+    "*.log"
+  ],
+  "ext": "js,json",
+  "delay": "1000"
+} 
