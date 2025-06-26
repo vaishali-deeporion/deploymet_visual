@@ -24,8 +24,11 @@ const PUPPETEER_CONFIG = {
         '--no-first-run',
         '--no-zygote',
         '--single-process',
-        '--disable-gpu'
-    ]
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor'
+    ],
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
 };
 
 // Test environment management
@@ -1115,18 +1118,43 @@ process.on('SIGINT', () => {
 //     });
 // });
 
-http.listen(PORT, () => {
+http.listen(PORT, async () => {
     console.log(`🚀 Visual Regression Server running on port ${PORT}`);
     console.log(`📊 Open http://localhost:${PORT} to start testing`);
     console.log(`🔌 WebSocket endpoint: ws://localhost:${PORT}/ws`);
+    
+    // Test Puppeteer availability
+    const puppeteerWorking = await testPuppeteer();
     
     // Check BackstopJS availability
     const { exec } = require('child_process');
     exec('npx backstop --version', (error, stdout, stderr) => {
         if (error) {
             console.log('⚠️  BackstopJS not found. Please run: npm install');
+            console.error('BackstopJS error:', error.message);
         } else {
             console.log('✅ BackstopJS ready:', stdout.trim());
         }
+        
+        if (puppeteerWorking) {
+            console.log('🎯 System ready for visual regression testing!');
+        } else {
+            console.log('⚠️  Chrome/Puppeteer issues detected - visual tests may fail');
+        }
     });
 });
+
+// Test Chrome/Puppeteer availability on startup
+async function testPuppeteer() {
+    try {
+        console.log('🔍 Testing Puppeteer/Chrome availability...');
+        const browser = await puppeteer.launch(PUPPETEER_CONFIG);
+        await browser.close();
+        console.log('✅ Puppeteer/Chrome is working correctly');
+        return true;
+    } catch (error) {
+        console.error('❌ Puppeteer/Chrome test failed:', error.message);
+        console.error('Chrome executable path:', process.env.PUPPETEER_EXECUTABLE_PATH);
+        return false;
+    }
+}
