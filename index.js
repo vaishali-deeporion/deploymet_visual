@@ -13,6 +13,21 @@ const WebSocket = require('ws');
 // Base configuration
 const BASE_DATA_DIR = process.env.BASE_DATA_DIR || './server_data';
 
+// Puppeteer configuration for Railway deployment
+const PUPPETEER_CONFIG = {
+    headless: 'new',
+    args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+    ]
+};
+
 // Test environment management
 const activeTestEnvironments = new Map();
 const wsClients = new Map(); // socketId -> { ws, subscriptions, lastPing }
@@ -37,6 +52,17 @@ app.use(cors({
 }));
 
 app.use(bodyParser.json());
+
+// Health check endpoint for Railway
+app.get('/api/health', (req, res) => {
+    res.status(200).json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        environment: process.env.NODE_ENV || 'development',
+        activeTests: activeTestEnvironments.size
+    });
+});
 
 // Serve static files from test environments
 app.use('/backstop_data/:testId', (req, res, next) => {
@@ -260,15 +286,7 @@ function clearBackstopData(testEnv) {
 
 // Function to load and scroll through a page to ensure all content is loaded
 async function loadAndScrollPage(scenario) {
-    const browser = await puppeteer.launch({
-            headless: 'new',
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-            '--disable-gpu'
-        ]
-    });
+    const browser = await puppeteer.launch(PUPPETEER_CONFIG);
     const page = await browser.newPage();
     try {
         console.log(`Processing URL: ${scenario.url}`);
@@ -419,10 +437,7 @@ async function fetchAllRoutes(url, testId) {
         emitStatus(testId, 'crawling', 'Starting website crawl to discover routes...');
         logMessage(testId, 'Starting to crawl website for routes...');
         
-        const browser = await puppeteer.launch({
-            args: ['--no-sandbox', '--disable-setuid-sandbox'],
-            headless: 'new'
-        });
+        const browser = await puppeteer.launch(PUPPETEER_CONFIG);
         
         let pageCount = 0;
         const MAX_PAGES = 50;
