@@ -4,12 +4,12 @@
   "description": "Visual Regression Testing Backend Server with Session-based Browser Isolation",
   "main": "index.js",
   "scripts": {
-    "start": "NODE_ENV=production node index.js",
+    "start": "node index.js",
     "dev": "nodemon index.js",
     "prod": "NODE_ENV=production node index.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "health": "curl -f http://localhost:3000/api/health",
-    "railway": "NODE_ENV=production node index.js"
+    "railway": "node index.js"
   },
   "keywords": [
     "visual-regression",
