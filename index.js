@@ -420,7 +420,7 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
     console.log(`📁 Config path: ${configPath}`);
     console.log(`🔧 Chrome executable: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
     
-    const process = spawn('npx', ['backstop', command, `--config=${configPath}`], {
+    const childProcess = spawn('npx', ['backstop', command, `--config=${configPath}`], {
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: false,
         env: {
@@ -439,7 +439,7 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
                `Starting BackstopJS ${command}...`);
     
     // Stream stdout - send filtered output to WebSocket
-    process.stdout.on('data', (data) => {
+    childProcess.stdout.on('data', (data) => {
         const message = data.toString();
         output += message;
         console.log(`[${testId}] BackstopJS stdout:`, message.trim());
@@ -483,7 +483,7 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
     });
     
     // Stream stderr - send filtered errors to WebSocket
-    process.stderr.on('data', (data) => {
+    childProcess.stderr.on('data', (data) => {
         const error = data.toString();
         errorOutput += error;
         console.error(`[${testId}] BackstopJS stderr:`, error.trim());
@@ -497,7 +497,7 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
         });
     });
     
-    process.on('close', (code) => {
+    childProcess.on('close', (code) => {
         const statusMessage = `BackstopJS ${command} completed with exit code: ${code}`;
         console.log(`[${testId}] ${statusMessage}`);
         console.log(`[${testId}] Full stdout:`, output);
@@ -520,17 +520,17 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
     
     // Handle process timeout
     const timeout = setTimeout(() => {
-        process.kill('SIGTERM');
+        childProcess.kill('SIGTERM');
         emitStatus(testId, 'error', `BackstopJS ${command} process timed out`);
         logMessage(testId, `BackstopJS ${command} process timed out`, 'error');
         emitError(testId, `${command} process timed out`);
     }, 300000); // 5 minutes timeout
     
-    process.on('close', () => {
+    childProcess.on('close', () => {
         clearTimeout(timeout);
     });
     
-    return process;
+    return childProcess;
 }
 
 // Enhanced fetchAllRoutes with detailed progress updates
