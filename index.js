@@ -13,7 +13,7 @@ const WebSocket = require('ws');
 // Base configuration
 const BASE_DATA_DIR = process.env.BASE_DATA_DIR || './server_data';
 
-// Puppeteer configuration for Railway deployment
+// Puppeteer configuration for Railway deployment - optimized for low resources
 const PUPPETEER_CONFIG = {
     headless: 'new',
     args: [
@@ -26,14 +26,50 @@ const PUPPETEER_CONFIG = {
         '--single-process',
         '--disable-gpu',
         '--disable-web-security',
-        '--disable-features=VizDisplayCompositor'
+        '--disable-features=VizDisplayCompositor',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-ipc-flooding-protection',
+        '--memory-pressure-off',
+        '--max_old_space_size=512',
+        '--disable-extensions',
+        '--disable-plugins',
+        '--disable-images',
+        '--disable-javascript',
+        '--disable-default-apps',
+        '--disable-sync',
+        '--disable-translate',
+        '--hide-scrollbars',
+        '--mute-audio',
+        '--no-default-browser-check',
+        '--no-first-run',
+        '--disable-background-networking',
+        '--disable-background-timer-throttling',
+        '--disable-client-side-phishing-detection',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-default-apps',
+        '--disable-hang-monitor',
+        '--disable-prompt-on-repost',
+        '--disable-web-resources'
     ],
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
+    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    timeout: 60000,
+    // Reduce memory usage
+    defaultViewport: { width: 1024, height: 768 },
+    // Limit concurrent processes
+    pipe: true
 };
 
 // Test environment management
 const activeTestEnvironments = new Map();
 const wsClients = new Map(); // socketId -> { ws, subscriptions, lastPing }
+
+// Global browser instance management
+let globalBrowser = null;
+let browserLaunchPromise = null;
+let activeBrowserSessions = 0;
+const MAX_CONCURRENT_SESSIONS = 1; // Limit to 1 concurrent session
 
 // Ensure base directory exists
 if (!fs.existsSync(BASE_DATA_DIR)) {
@@ -65,6 +101,49 @@ app.get('/api/health', (req, res) => {
         environment: process.env.NODE_ENV || 'development',
         activeTests: activeTestEnvironments.size
     });
+});
+
+// Test Chrome/Puppeteer endpoint
+app.get('/api/test-chrome', async (req, res) => {
+    let browser = null;
+    let page = null;
+    
+    try {
+        console.log('🔍 Testing Chrome via API endpoint...');
+        browser = await getBrowserInstance();
+        page = await browser.newPage();
+        await page.setViewport({ width: 1024, height: 768 });
+        await page.goto('https://example.com', { waitUntil: 'networkidle2', timeout: 30000 });
+        const title = await page.title();
+        
+        res.json({
+            status: 'success',
+            message: 'Chrome/Puppeteer is working',
+            testUrl: 'https://example.com',
+            pageTitle: title,
+            chromeExecutable: process.env.PUPPETEER_EXECUTABLE_PATH,
+            activeSessions: activeBrowserSessions,
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('❌ Chrome test failed:', error);
+        res.status(500).json({
+            status: 'failed',
+            error: error.message,
+            chromeExecutable: process.env.PUPPETEER_EXECUTABLE_PATH,
+            activeSessions: activeBrowserSessions,
+            timestamp: new Date().toISOString()
+        });
+    } finally {
+        if (page) {
+            try {
+                await page.close();
+            } catch (error) {
+                console.error('Error closing page:', error);
+            }
+        }
+        releaseBrowserSession();
+    }
 });
 
 // Serve static files from test environments
@@ -289,46 +368,65 @@ function clearBackstopData(testEnv) {
 
 // Function to load and scroll through a page to ensure all content is loaded
 async function loadAndScrollPage(scenario) {
-    const browser = await puppeteer.launch(PUPPETEER_CONFIG);
-    const page = await browser.newPage();
+    let browser = null;
+    let page = null;
+    
     try {
         console.log(`Processing URL: ${scenario.url}`);
-        await page.goto(scenario.url, { waitUntil: 'networkidle2' });
-        await page.reload({ waitUntil: 'networkidle2', timeout: 60000 });
-        await page.waitForSelector('body', { visible: true, timeout: 120000 });
+        browser = await getBrowserInstance();
+        page = await browser.newPage();
+        
+        // Set a smaller viewport to reduce memory usage
+        await page.setViewport({ width: 1024, height: 768 });
+        
+        await page.goto(scenario.url, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.waitForSelector('body', { visible: true, timeout: 60000 });
+        
+        // Simplified scrolling to reduce resource usage
         await page.evaluate(async () => {
-            const scrollStep = 100;
-            const delay = 50;
-            async function scrollPage() {
-                const pageHeight = document.body.scrollHeight;
-                const totalSteps = Math.round(pageHeight / scrollStep);
-                for (let i = 0; i < totalSteps; i++) {
-                    window.scrollBy(0, scrollStep);
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                  //  window.scrollBy(0, 0);
-                  // await new Promise(resolve => setTimeout(resolve, delay));
-                  }
-                // Scroll back to the top
-                window.scrollTo(0, 0);
-                // await new Promise(resolve => setTimeout(resolve, delay));
+            const scrollStep = 200;
+            const delay = 100;
+            const pageHeight = document.body.scrollHeight;
+            const totalSteps = Math.min(Math.round(pageHeight / scrollStep), 10); // Limit scrolling
+            
+            for (let i = 0; i < totalSteps; i++) {
+                window.scrollBy(0, scrollStep);
+                await new Promise(resolve => setTimeout(resolve, delay));
             }
-            await scrollPage();
+            // Scroll back to the top
+            window.scrollTo(0, 0);
         });
+        
         console.log('Scrolling completed');
         return { url: scenario.url, status: 'success' };
     } catch (error) {
         console.error(`Error processing URL: ${scenario.url}`, error);
         return { url: scenario.url, status: 'failed', error: error.message };
     } finally {
-        await browser.close(); // Close the browser instance
+        if (page) {
+            try {
+                await page.close();
+            } catch (error) {
+                console.error('Error closing page:', error);
+            }
+        }
+        releaseBrowserSession();
     }
 }
 
 // Enhanced BackstopJS process runner with detailed progress tracking
 function runBackstopCommand(command, configPath, testId, onComplete) {
+    console.log(`🚀 Starting BackstopJS ${command} for testId: ${testId}`);
+    console.log(`📁 Config path: ${configPath}`);
+    console.log(`🔧 Chrome executable: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
+    
     const process = spawn('npx', ['backstop', command, `--config=${configPath}`], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        detached: false
+        detached: false,
+        env: {
+            ...process.env,
+            PUPPETEER_EXECUTABLE_PATH: process.env.PUPPETEER_EXECUTABLE_PATH
+        }
     });
     
     let output = '';
@@ -344,6 +442,7 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
     process.stdout.on('data', (data) => {
         const message = data.toString();
         output += message;
+        console.log(`[${testId}] BackstopJS stdout:`, message.trim());
         
         // Parse BackstopJS output for progress information
         const lines = message.split('\n').filter(line => line.trim());
@@ -387,6 +486,7 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
     process.stderr.on('data', (data) => {
         const error = data.toString();
         errorOutput += error;
+        console.error(`[${testId}] BackstopJS stderr:`, error.trim());
         
         const lines = error.split('\n').filter(line => line.trim());
         lines.forEach(line => {
@@ -399,14 +499,19 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
     
     process.on('close', (code) => {
         const statusMessage = `BackstopJS ${command} completed with exit code: ${code}`;
+        console.log(`[${testId}] ${statusMessage}`);
+        console.log(`[${testId}] Full stdout:`, output);
+        console.log(`[${testId}] Full stderr:`, errorOutput);
         
         if (code === 0) {
             emitStatus(testId, 'success', statusMessage);
         } else if (code === 1 && command === 'test') {
             // Exit code 1 for test command usually means differences found (not an error)
             emitStatus(testId, 'completed-with-differences', 'Test completed - visual differences detected');
-                        } else {
+        } else {
             emitStatus(testId, 'error', `Command failed: ${statusMessage}`);
+            logMessage(testId, `BackstopJS Error Details - stdout: ${output}`, 'error');
+            logMessage(testId, `BackstopJS Error Details - stderr: ${errorOutput}`, 'error');
         }
         
         logMessage(testId, statusMessage);
@@ -422,7 +527,7 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
     }, 300000); // 5 minutes timeout
     
     process.on('close', () => {
-                                clearTimeout(timeout);
+        clearTimeout(timeout);
     });
     
     return process;
@@ -533,16 +638,14 @@ function generateBackstopConfig(prodUrl, stagingUrl, routes, testEnv) {
         misMatchThreshold: 0.1,
         requireSameDimensions: true,
         waitForSelector: 'body',
-        delay: 2000,
-        postInteractionWait: 1000
+        delay: 3000,
+        postInteractionWait: 2000
     }));
 
     return {
         id: `visual_regression_test_${testEnv.testId}`,
         viewports: [
-            { label: "phone", width: 375, height: 667 },
-            { label: "tablet", width: 1024, height: 768 },
-            { label: "desktop", width: 1920, height: 1080 }
+            { label: "desktop", width: 1024, height: 768 } // Only one viewport to save resources
         ],
         scenarios,
         paths: {
@@ -555,16 +658,29 @@ function generateBackstopConfig(prodUrl, stagingUrl, routes, testEnv) {
         report: ["browser"],
         engine: "puppeteer",
         engineOptions: {
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
             args: [
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu"
+                "--disable-gpu",
+                "--disable-web-security",
+                "--disable-features=VizDisplayCompositor",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--memory-pressure-off",
+                "--max_old_space_size=512",
+                "--disable-extensions",
+                "--disable-plugins",
+                "--disable-images",
+                "--disable-default-apps"
             ]
         },
-        asyncCaptureLimit: 5,
-        asyncCompareLimit: 50,
-        debug: false,
+        asyncCaptureLimit: 1, // Only 1 concurrent capture
+        asyncCompareLimit: 1,  // Only 1 concurrent comparison
+        debug: true,
+        debugWindow: false,
         openReport: false
     };
 }
@@ -1059,8 +1175,18 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
     console.log('SIGTERM received, shutting down gracefully');
+    
+    // Close browser first
+    if (globalBrowser) {
+        try {
+            await globalBrowser.close();
+            console.log('Browser closed successfully');
+        } catch (error) {
+            console.error('Error closing browser:', error);
+        }
+    }
     
     // Notify all clients about shutdown (server-level message)
     broadcastToAllClients({
@@ -1081,8 +1207,18 @@ process.on('SIGTERM', () => {
     http.close(() => process.exit(0));
 });
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     console.log('SIGINT received, shutting down gracefully');
+    
+    // Close browser first
+    if (globalBrowser) {
+        try {
+            await globalBrowser.close();
+            console.log('Browser closed successfully');
+        } catch (error) {
+            console.error('Error closing browser:', error);
+        }
+    }
     
     broadcastToAllClients({
         type: 'server-shutdown',
@@ -1146,15 +1282,72 @@ http.listen(PORT, async () => {
 
 // Test Chrome/Puppeteer availability on startup
 async function testPuppeteer() {
+    let browser = null;
+    let page = null;
+    
     try {
         console.log('🔍 Testing Puppeteer/Chrome availability...');
-        const browser = await puppeteer.launch(PUPPETEER_CONFIG);
-        await browser.close();
+        browser = await getBrowserInstance();
+        page = await browser.newPage();
+        await page.goto('https://example.com', { timeout: 30000 });
         console.log('✅ Puppeteer/Chrome is working correctly');
         return true;
     } catch (error) {
         console.error('❌ Puppeteer/Chrome test failed:', error.message);
         console.error('Chrome executable path:', process.env.PUPPETEER_EXECUTABLE_PATH);
         return false;
+    } finally {
+        if (page) {
+            try {
+                await page.close();
+            } catch (error) {
+                console.error('Error closing page:', error);
+            }
+        }
+        releaseBrowserSession();
+    }
+}
+
+// Get or create shared browser instance
+async function getBrowserInstance() {
+    if (activeBrowserSessions >= MAX_CONCURRENT_SESSIONS) {
+        throw new Error('Maximum concurrent browser sessions reached. Please wait and try again.');
+    }
+
+    if (globalBrowser && globalBrowser.isConnected()) {
+        activeBrowserSessions++;
+        return globalBrowser;
+    }
+
+    if (browserLaunchPromise) {
+        globalBrowser = await browserLaunchPromise;
+        activeBrowserSessions++;
+        return globalBrowser;
+    }
+
+    browserLaunchPromise = puppeteer.launch(PUPPETEER_CONFIG);
+    globalBrowser = await browserLaunchPromise;
+    activeBrowserSessions++;
+    browserLaunchPromise = null;
+    
+    return globalBrowser;
+}
+
+// Release browser session
+function releaseBrowserSession() {
+    activeBrowserSessions = Math.max(0, activeBrowserSessions - 1);
+    
+    // Close browser if no active sessions
+    if (activeBrowserSessions === 0 && globalBrowser) {
+        setTimeout(async () => {
+            if (activeBrowserSessions === 0 && globalBrowser) {
+                try {
+                    await globalBrowser.close();
+                    globalBrowser = null;
+                } catch (error) {
+                    console.error('Error closing browser:', error);
+                }
+            }
+        }, 30000); // Close after 30 seconds of inactivity
     }
 }
