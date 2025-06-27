@@ -36,7 +36,6 @@ const PUPPETEER_CONFIG = {
         '--disable-extensions',
         '--disable-plugins',
         '--disable-images',
-        '--disable-javascript',
         '--disable-default-apps',
         '--disable-sync',
         '--disable-translate',
@@ -54,7 +53,7 @@ const PUPPETEER_CONFIG = {
         '--disable-web-resources'
     ],
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    timeout: 60000,
+    timeout: 90000, // Increased from 60000
     // Reduce memory usage
     defaultViewport: { width: 1024, height: 768 },
     // Limit concurrent processes
@@ -379,8 +378,14 @@ async function loadAndScrollPage(scenario) {
         // Set a smaller viewport to reduce memory usage
         await page.setViewport({ width: 1024, height: 768 });
         
-        await page.goto(scenario.url, { waitUntil: 'networkidle2', timeout: 30000 });
-        await page.waitForSelector('body', { visible: true, timeout: 60000 });
+        await page.goto(scenario.url, { 
+            waitUntil: 'networkidle2', 
+            timeout: 90000 // Increased from 30000
+        });
+        await page.waitForSelector('body', { 
+            visible: true, 
+            timeout: 90000 // Increased from 60000
+        });
         
         // Simplified scrolling to reduce resource usage
         await page.evaluate(async () => {
@@ -535,6 +540,7 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
 
 // Enhanced fetchAllRoutes with detailed progress updates
 async function fetchAllRoutes(url, testId) {
+    let browser = null;
     try {
         const baseUrl = url.replace(/\/$/, '');
         const baseUrlObj = new URL(baseUrl);
@@ -545,10 +551,11 @@ async function fetchAllRoutes(url, testId) {
         emitStatus(testId, 'crawling', 'Starting website crawl to discover routes...');
         logMessage(testId, 'Starting to crawl website for routes...');
         
-        const browser = await puppeteer.launch(PUPPETEER_CONFIG);
+        // Use shared browser instance instead of launching new one
+        browser = await getBrowserInstance();
         
         let pageCount = 0;
-        const MAX_PAGES = 50;
+        const MAX_PAGES = 20; // Reduced from 50 to save resources
         
         while (toVisit.size > 0 && visited.size < MAX_PAGES && pageCount < MAX_PAGES) {
             const currentPath = Array.from(toVisit)[0];
@@ -562,20 +569,24 @@ async function fetchAllRoutes(url, testId) {
             emitStepProgress(testId, 'crawling', pageCount, Math.min(MAX_PAGES, toVisit.size + pageCount), 
                            `Crawling page ${pageCount}: ${currentPath}`);
             
+            let page = null;
             try {
                 const fullUrl = baseUrl + currentPath;
                 emitStatus(testId, 'crawling', `Analyzing page: ${fullUrl}`);
                 logMessage(testId, `Crawling (${pageCount}/${MAX_PAGES}): ${fullUrl}`);
                 
-                const page = await browser.newPage();
-                await page.goto(fullUrl, { waitUntil: 'domcontentloaded' });
+                page = await browser.newPage();
+                
+                // Set shorter timeout for crawling
+                await page.goto(fullUrl, { 
+                    waitUntil: 'domcontentloaded', 
+                    timeout: 30000 // 30 seconds timeout
+                });
                 
                 const links = await page.evaluate(() => {
                     const anchors = document.querySelectorAll('a[href]');
                     return Array.from(anchors).map(a => a.href);
                 });
-                
-                await page.close();
                 
                 let newRoutesFound = 0;
                 for (const link of links) {
@@ -592,7 +603,7 @@ async function fetchAllRoutes(url, testId) {
                         
                         foundRoutes.add(pathname);
                         newRoutesFound++;
-                        if (toVisit.size < 50) {
+                        if (toVisit.size < 20) { // Reduced limit
                             toVisit.add(pathname);
                         }
                     } catch (e) {
@@ -608,10 +619,16 @@ async function fetchAllRoutes(url, testId) {
                 emitStatus(testId, 'warning', `Error crawling ${currentPath}: ${error.message}`);
                 logMessage(testId, `Error crawling ${currentPath}: ${error.message}`, 'error');
                 continue;
+            } finally {
+                if (page) {
+                    try {
+                        await page.close();
+                    } catch (error) {
+                        console.error('Error closing page:', error);
+                    }
+                }
             }
         }
-        
-        await browser.close();
         
         const routes = Array.from(foundRoutes);
         emitStatus(testId, 'crawling-complete', `Crawling complete! Found ${routes.length} routes to test`);
@@ -622,6 +639,8 @@ async function fetchAllRoutes(url, testId) {
         emitStatus(testId, 'error', `Error during crawling: ${error.message}`);
         logMessage(testId, `Error in fetchAllRoutes: ${error.message}`, 'error');
         return ['/'];
+    } finally {
+        releaseBrowserSession();
     }
 }
 
@@ -638,8 +657,13 @@ function generateBackstopConfig(prodUrl, stagingUrl, routes, testEnv) {
         misMatchThreshold: 0.1,
         requireSameDimensions: true,
         waitForSelector: 'body',
-        delay: 3000,
-        postInteractionWait: 2000
+        delay: 2000, // Reduced from 3000
+        postInteractionWait: 1000, // Reduced from 2000
+        // Add navigation timeout settings
+        navigationTimeout: 90000, // 90 seconds
+        loadTimeout: 90000, // 90 seconds
+        // Add retry settings
+        retry: 2
     }));
 
     return {
@@ -674,8 +698,18 @@ function generateBackstopConfig(prodUrl, stagingUrl, routes, testEnv) {
                 "--disable-extensions",
                 "--disable-plugins",
                 "--disable-images",
-                "--disable-default-apps"
-            ]
+                "--disable-default-apps",
+                "--disable-sync",
+                "--disable-translate",
+                "--disable-background-networking",
+                "--disable-client-side-phishing-detection",
+                "--disable-component-extensions-with-background-pages",
+                "--disable-hang-monitor"
+            ],
+            // Add global timeouts
+            timeout: 90000, // 90 seconds
+            navigationTimeout: 90000,
+            protocolTimeout: 90000
         },
         asyncCaptureLimit: 1, // Only 1 concurrent capture
         asyncCompareLimit: 1,  // Only 1 concurrent comparison
@@ -727,7 +761,7 @@ app.post('/api/test', async (req, res) => {
         // Step 3: Find routes
         emitStatus(testEnv.testId, 'crawling', 'Discovering website routes...');
         const routes = await fetchAllRoutes(prodUrl, testEnv.testId);
-        const routesToTest = routes.slice(0, 20); // Limit routes
+        const routesToTest = routes.slice(0, 10); // Reduced from 40 to be more conservative
         
         // Step 3.5: Pre-load and scroll pages
         emitStatus(testEnv.testId, 'preloading', 'Pre-loading and scrolling pages to ensure full content is captured...');
