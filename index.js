@@ -15,49 +15,33 @@ const BASE_DATA_DIR = process.env.BASE_DATA_DIR || './server_data';
 
 // Puppeteer configuration for Railway deployment - optimized for low resources
 const PUPPETEER_CONFIG = {
-    headless: 'new',
+    headless: true,
     args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process',
         '--disable-gpu',
         '--disable-web-security',
-        '--disable-features=VizDisplayCompositor',
+        '--disable-features=site-per-process',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-extensions',
+        '--disable-plugins',
+        '--disable-default-apps',
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
+        '--disable-field-trial-config',
+        '--disable-back-forward-cache',
         '--disable-ipc-flooding-protection',
+        '--single-process', // This can help with frame detachment issues
         '--memory-pressure-off',
-        '--max_old_space_size=512',
-        '--disable-extensions',
-        '--disable-plugins',
-        '--disable-images',
-        '--disable-default-apps',
-        '--disable-sync',
-        '--disable-translate',
-        '--hide-scrollbars',
-        '--mute-audio',
-        '--no-default-browser-check',
-        '--no-first-run',
-        '--disable-background-networking',
-        '--disable-background-timer-throttling',
-        '--disable-client-side-phishing-detection',
-        '--disable-component-extensions-with-background-pages',
-        '--disable-default-apps',
-        '--disable-hang-monitor',
-        '--disable-prompt-on-repost',
-        '--disable-web-resources'
+        '--max_old_space_size=4096'
     ],
+    ignoreDefaultArgs: ['--disable-extensions'],
     executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-    timeout: 90000, // Increased from 60000
+    timeout: 120000, // Increased timeout
     // Reduce memory usage
     defaultViewport: { width: 1024, height: 768 },
-    // Limit concurrent processes
-    pipe: true
 };
 
 // Test environment management
@@ -365,176 +349,343 @@ function clearBackstopData(testEnv) {
     });
 }
 
-// Function to load and scroll through a page to ensure all content is loaded
+// Load and scroll page with enhanced error handling
 async function loadAndScrollPage(scenario) {
     let browser = null;
     let page = null;
+    let retryCount = 0;
+    const maxRetries = 3;
     
-    try {
-        console.log(`Processing URL: ${scenario.url}`);
-        browser = await getBrowserInstance();
-        page = await browser.newPage();
-        
-        // Set a smaller viewport to reduce memory usage
-        await page.setViewport({ width: 1024, height: 768 });
-        
-        await page.goto(scenario.url, { 
-            waitUntil: 'networkidle2', 
-            timeout: 90000 // Increased from 30000
-        });
-        await page.waitForSelector('body', { 
-            visible: true, 
-            timeout: 90000 // Increased from 60000
-        });
-        
-        // Simplified scrolling to reduce resource usage
-        await page.evaluate(async () => {
-            const scrollStep = 200;
-            const delay = 100;
-            const pageHeight = document.body.scrollHeight;
-            const totalSteps = Math.min(Math.round(pageHeight / scrollStep), 10); // Limit scrolling
+    // Normalize URL to prevent double slashes
+    const normalizedUrl = scenario.url.replace(/([^:]\/)\/+/g, '$1');
+    const cleanScenario = { ...scenario, url: normalizedUrl };
+    
+    const navigationStrategies = [
+        { waitUntil: 'domcontentloaded', timeout: 45000 },
+        { waitUntil: 'networkidle0', timeout: 30000 },
+        { waitUntil: 'load', timeout: 60000 }
+    ];
+    
+    while (retryCount <= maxRetries) {
+        try {
+            console.log(`Processing URL: ${cleanScenario.url} (attempt ${retryCount + 1})`);
             
-            for (let i = 0; i < totalSteps; i++) {
-                window.scrollBy(0, scrollStep);
-                await new Promise(resolve => setTimeout(resolve, delay));
+            // Always get a fresh browser instance to avoid frame detachment
+            if (globalBrowser) {
+                try {
+                    await globalBrowser.close();
+                    globalBrowser = null;
+                } catch (error) {
+                    console.log('Error closing previous browser:', error.message);
+                }
             }
-            // Scroll back to the top
-            window.scrollTo(0, 0);
-        });
-        
-        console.log('Scrolling completed');
-        return { url: scenario.url, status: 'success' };
-    } catch (error) {
-        console.error(`Error processing URL: ${scenario.url}`, error);
-        return { url: scenario.url, status: 'failed', error: error.message };
-    } finally {
-        if (page) {
+            
+            browser = await getBrowserInstance();
+            page = await browser.newPage();
+            
+            // Configure page to be more stable
+            await page.setViewport({ width: 1024, height: 768 });
+            await page.setUserAgent('Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+            
+            // Set timeouts based on retry attempt
+            const baseTimeout = Math.max(30000, 60000 - (retryCount * 15000));
+            page.setDefaultTimeout(baseTimeout);
+            page.setDefaultNavigationTimeout(baseTimeout);
+            
+            // Use different navigation strategy for each retry
+            const strategy = navigationStrategies[retryCount % navigationStrategies.length];
+            
+            console.log(`Using navigation strategy: ${strategy.waitUntil} with ${strategy.timeout}ms timeout`);
+            
+            // Add comprehensive error handlers
+            const errors = [];
+            page.on('error', (error) => {
+                errors.push(`Page error: ${error.message}`);
+                console.log(`Page error for ${cleanScenario.url}:`, error.message);
+            });
+            
+            page.on('pageerror', (error) => {
+                errors.push(`Page script error: ${error.message}`);
+                console.log(`Page script error for ${cleanScenario.url}:`, error.message);
+            });
+            
+            page.on('requestfailed', (request) => {
+                console.log(`Request failed for ${cleanScenario.url}: ${request.url()} - ${request.failure()?.errorText}`);
+            });
+            
+            // Navigate with the selected strategy
+            console.log(`Navigating to ${cleanScenario.url}...`);
+            await page.goto(cleanScenario.url, {
+                waitUntil: strategy.waitUntil,
+                timeout: strategy.timeout
+            });
+            
+            console.log(`Navigation completed for ${cleanScenario.url}`);
+            
+            // Wait for body with timeout
             try {
-                await page.close();
-            } catch (error) {
-                console.error('Error closing page:', error);
+                await page.waitForSelector('body', { 
+                    visible: true, 
+                    timeout: 15000 
+                });
+                console.log(`Body selector found for ${cleanScenario.url}`);
+            } catch (selectorError) {
+                console.log(`Body selector wait failed for ${cleanScenario.url}, continuing anyway...`);
             }
+            
+            // Wait a bit for page stabilization
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            // Perform simple scroll operation
+            try {
+                console.log(`Starting scroll operation for ${cleanScenario.url}`);
+                await page.evaluate(() => {
+                    return new Promise((resolve) => {
+                        try {
+                            // Simple scroll to bottom and back to top
+                            const scrollHeight = Math.min(document.body.scrollHeight, 5000); // Limit scroll distance
+                            window.scrollTo(0, scrollHeight);
+                            
+                            setTimeout(() => {
+                                window.scrollTo(0, 0);
+                                resolve();
+                            }, 1000);
+                        } catch (scrollError) {
+                            console.log('Scroll evaluation error:', scrollError);
+                            resolve();
+                        }
+                    });
+                });
+                console.log(`Scroll operation completed for ${cleanScenario.url}`);
+            } catch (scrollError) {
+                console.log('Scroll operation failed, continuing...', scrollError.message);
+            }
+            
+            // Final wait
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            console.log(`Page processing completed successfully for ${cleanScenario.url}`);
+            
+            if (errors.length > 0) {
+                console.log(`Page had ${errors.length} errors but completed:`, errors);
+            }
+            
+            return { 
+                url: cleanScenario.url, 
+                status: 'success', 
+                success: true,
+                errors: errors.length > 0 ? errors : undefined,
+                strategy: strategy.waitUntil,
+                attempts: retryCount + 1
+            };
+            
+        } catch (error) {
+            console.error(`Error processing URL: ${cleanScenario.url} (attempt ${retryCount + 1})`, error);
+            
+            // Categorize the error for better handling
+            let errorType = 'unknown';
+            let shouldRetry = false;
+            
+            if (error.message.includes('frame was detached') || error.message.includes('Navigating frame was detached')) {
+                errorType = 'frame_detached';
+                shouldRetry = true;
+            } else if (error.message.includes('Protocol error') || error.message.includes('Connection closed')) {
+                errorType = 'protocol_error';
+                shouldRetry = true;
+            } else if (error.message.includes('timeout') || error.message.includes('Navigation timeout')) {
+                errorType = 'timeout';
+                shouldRetry = true;
+            } else if (error.message.includes('net::ERR_')) {
+                errorType = 'network_error';
+                shouldRetry = retryCount < 2; // Retry network errors only twice
+            } else if (error.message.includes('Target closed')) {
+                errorType = 'target_closed';
+                shouldRetry = true;
+            }
+            
+            if (shouldRetry && retryCount < maxRetries) {
+                retryCount++;
+                console.log(`Retrying ${cleanScenario.url} due to ${errorType} (attempt ${retryCount + 1}/${maxRetries + 1})`);
+                
+                // Progressive wait time
+                const waitTime = 2000 + (retryCount * 2000);
+                await new Promise(resolve => setTimeout(resolve, waitTime));
+                continue;
+            } else {
+                console.log(`Max retries reached for ${cleanScenario.url}, giving up`);
+                return { 
+                    url: cleanScenario.url, 
+                    status: 'failed', 
+                    success: false,
+                    error: error.message,
+                    errorType,
+                    attempts: retryCount + 1
+                };
+            }
+        } finally {
+            if (page) {
+                try {
+                    if (!page.isClosed()) {
+                        await page.close();
+                    }
+                } catch (closeError) {
+                    console.log('Page close error (ignored):', closeError.message);
+                }
+            }
+            releaseBrowserSession();
         }
-        releaseBrowserSession();
     }
 }
 
 // Enhanced BackstopJS process runner with detailed progress tracking
 function runBackstopCommand(command, configPath, testId, onComplete) {
+    const backstopCommand = `npx backstop ${command} --config="${configPath}"`;
+    const chromeExecutable = process.env.PUPPETEER_EXECUTABLE_PATH || 'default';
+    
     console.log(`🚀 Starting BackstopJS ${command} for testId: ${testId}`);
     console.log(`📁 Config path: ${configPath}`);
-    console.log(`🔧 Chrome executable: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
+    console.log(`🔧 Chrome executable: ${chromeExecutable}`);
+    
+    // Verify config file exists
+    if (!fs.existsSync(configPath)) {
+        console.error(`❌ Config file does not exist: ${configPath}`);
+        logMessage(testId, `Config file missing: ${configPath}`, 'error');
+        onComplete(1, '', 'Config file not found');
+        return;
+    }
+    
+    // Verify directories exist
+    try {
+        const configContent = fs.readFileSync(configPath, 'utf8');
+        
+        // More robust parsing - handle different module export formats
+        let jsonString = configContent;
+        
+        // Remove module.exports = and any trailing semicolon
+        jsonString = jsonString.replace(/^\s*module\.exports\s*=\s*/, '');
+        jsonString = jsonString.replace(/;\s*$/, '');
+        jsonString = jsonString.trim();
+        
+        const config = JSON.parse(jsonString);
+        
+        // Ensure all required directories exist
+        Object.values(config.paths).forEach(dirPath => {
+            if (!fs.existsSync(dirPath)) {
+                fs.mkdirSync(dirPath, { recursive: true });
+                console.log(`📁 Created directory: ${dirPath}`);
+            }
+        });
+        
+        logMessage(testId, `Starting BackstopJS ${command} with ${config.scenarios.length} scenarios`);
+        
+    } catch (error) {
+        console.error(`❌ Error reading config file: ${error.message}`);
+        console.error(`❌ Config file content preview:`, fs.readFileSync(configPath, 'utf8').substring(0, 200));
+        logMessage(testId, `Config file error: ${error.message}`, 'error');
+        onComplete(1, '', `Config file error: ${error.message}`);
+        return;
+    }
     
     const childProcess = spawn('npx', ['backstop', command, `--config=${configPath}`], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: false,
+        cwd: process.cwd(),
         env: {
             ...process.env,
-            PUPPETEER_EXECUTABLE_PATH: process.env.PUPPETEER_EXECUTABLE_PATH
+            PUPPETEER_EXECUTABLE_PATH: process.env.PUPPETEER_EXECUTABLE_PATH || undefined
         }
     });
-    
-    let output = '';
-    let errorOutput = '';
-    let currentStep = 0;
-    let totalSteps = 0;
-    
-    // Emit that the BackstopJS command has started
-    emitStatus(testId, command === 'reference' ? 'creating-reference' : 'running-test', 
-               `Starting BackstopJS ${command}...`);
-    
-    // Stream stdout - send filtered output to WebSocket
+
+    let stdout = '';
+    let stderr = '';
+    let hasEmittedError = false;
+
     childProcess.stdout.on('data', (data) => {
-        const message = data.toString();
-        output += message;
-        console.log(`[${testId}] BackstopJS stdout:`, message.trim());
+        const output = data.toString();
+        stdout += output;
         
-        // Parse BackstopJS output for progress information
-        const lines = message.split('\n').filter(line => line.trim());
+        // Broadcast real-time output to clients
+        const lines = output.split('\n').filter(line => line.trim());
         lines.forEach(line => {
             if (line.trim()) {
-                // Look for progress indicators in BackstopJS output
-                if (line.includes('Setting up')) {
-                    emitStatus(testId, 'processing', `Setting up: ${line.trim()}`);
-                } else if (line.includes('Capturing')) {
-                    // Parse scenario progress
-                    const scenarioMatch = line.match(/(\d+).*?(\d+)/);
-                    if (scenarioMatch) {
-                        const current = parseInt(scenarioMatch[1]);
-                        const total = parseInt(scenarioMatch[2]);
-                        emitStepProgress(testId, command, current, total, `Capturing scenario ${current} of ${total}`);
-                    }
-                    emitStatus(testId, 'processing', `Capturing: ${line.trim()}`);
-                } else if (line.includes('Comparing')) {
-                    const compareMatch = line.match(/(\d+).*?(\d+)/);
-                    if (compareMatch) {
-                        const current = parseInt(compareMatch[1]);
-                        const total = parseInt(compareMatch[2]);
-                        emitStepProgress(testId, 'comparing', current, total, `Comparing scenario ${current} of ${total}`);
-                    }
-                    emitStatus(testId, 'processing', `Comparing: ${line.trim()}`);
-                } else if (line.includes('report')) {
-                    emitStatus(testId, 'generating-report', `Generating report: ${line.trim()}`);
-                } else if (line.includes('PASS') || line.includes('SUCCESS')) {
-                    emitStatus(testId, 'success', `Success: ${line.trim()}`);
-                } else if (line.includes('FAIL') || line.includes('ERROR')) {
-                    emitStatus(testId, 'warning', `Warning: ${line.trim()}`);
-                } else {
-                    // General BackstopJS output
-                    logMessage(testId, `BackstopJS ${command}: ${line.trim()}`);
+                logMessage(testId, line.trim());
+            }
+        });
+        
+        // Check for specific error patterns and provide helpful messages
+        if (output.includes('Error: Failed to launch')) {
+            if (!hasEmittedError) {
+                logMessage(testId, '❌ Browser launch failed - this may be due to missing Chrome or system resource limits', 'error');
+                hasEmittedError = true;
+            }
+        } else if (output.includes('TimeoutError') || output.includes('Navigation timeout')) {
+            if (!hasEmittedError) {
+                logMessage(testId, '⏱️ Navigation timeout - some URLs may be slow to load', 'warning');
+                hasEmittedError = true;
+            }
+        } else if (output.includes('net::ERR_')) {
+            if (!hasEmittedError) {
+                logMessage(testId, '🌐 Network error encountered - check if URLs are accessible', 'warning');
+                hasEmittedError = true;
+            }
+        } else if (output.includes('Protocol error')) {
+            if (!hasEmittedError) {
+                logMessage(testId, '🔌 Browser protocol error - attempting to continue', 'warning');
+                hasEmittedError = true;
+            }
+        }
+    });
+
+    childProcess.stderr.on('data', (data) => {
+        const error = data.toString();
+        stderr += error;
+        
+        // Log stderr but don't treat all stderr as errors (some are just warnings)
+        const lines = error.split('\n').filter(line => line.trim());
+        lines.forEach(line => {
+            if (line.trim()) {
+                // Only log actual errors, not deprecation warnings
+                if (line.includes('Error:') || line.includes('Failed:') || line.includes('FATAL:')) {
+                    logMessage(testId, line.trim(), 'error');
+                } else if (line.includes('Warning:') || line.includes('WARN:')) {
+                    logMessage(testId, line.trim(), 'warning');
                 }
             }
         });
     });
-    
-    // Stream stderr - send filtered errors to WebSocket
-    childProcess.stderr.on('data', (data) => {
-        const error = data.toString();
-        errorOutput += error;
-        console.error(`[${testId}] BackstopJS stderr:`, error.trim());
-        
-        const lines = error.split('\n').filter(line => line.trim());
-        lines.forEach(line => {
-            if (line.trim()) {
-                emitStatus(testId, 'error', `Error: ${line.trim()}`);
-                logMessage(testId, `BackstopJS ${command} stderr: ${line.trim()}`, 'error');
-            }
-        });
-    });
-    
+
     childProcess.on('close', (code) => {
-        const statusMessage = `BackstopJS ${command} completed with exit code: ${code}`;
-        console.log(`[${testId}] ${statusMessage}`);
-        console.log(`[${testId}] Full stdout:`, output);
-        console.log(`[${testId}] Full stderr:`, errorOutput);
+        console.log(`[${testId}] BackstopJS ${command} completed with exit code: ${code}`);
+        console.log(`[${testId}] Full stdout: ${stdout}`);
+        console.log(`[${testId}] Full stderr: ${stderr}`);
         
+        // Provide detailed completion message
         if (code === 0) {
-            emitStatus(testId, 'success', statusMessage);
+            logMessage(testId, `✅ BackstopJS ${command} completed successfully`);
         } else if (code === 1 && command === 'test') {
-            // Exit code 1 for test command usually means differences found (not an error)
-            emitStatus(testId, 'completed-with-differences', 'Test completed - visual differences detected');
+            logMessage(testId, `📊 BackstopJS test completed - visual differences detected (this is normal)`);
         } else {
-            emitStatus(testId, 'error', `Command failed: ${statusMessage}`);
-            logMessage(testId, `BackstopJS Error Details - stdout: ${output}`, 'error');
-            logMessage(testId, `BackstopJS Error Details - stderr: ${errorOutput}`, 'error');
+            logMessage(testId, `❌ BackstopJS ${command} failed with exit code ${code}`, 'error');
+            
+            // Provide specific error guidance
+            if (stdout.includes('No scenarios found') || stdout.includes('Selected 0 of')) {
+                logMessage(testId, '💡 Hint: No scenarios were found - check if URLs are valid and accessible', 'info');
+            } else if (stdout.includes('ENOENT') || stdout.includes('command not found')) {
+                logMessage(testId, '💡 Hint: BackstopJS may not be installed correctly', 'info');
+            } else if (stdout.includes('Permission denied')) {
+                logMessage(testId, '💡 Hint: Permission issue - check file/directory permissions', 'info');
+            } else if (stderr.includes('Chrome') || stderr.includes('Chromium')) {
+                logMessage(testId, '💡 Hint: Chrome/Chromium browser issue - ensure browser is properly installed', 'info');
+            }
         }
         
-        logMessage(testId, statusMessage);
-        onComplete(code, output, errorOutput);
+        onComplete(code, stdout, stderr);
     });
-    
-    // Handle process timeout
-    const timeout = setTimeout(() => {
-        childProcess.kill('SIGTERM');
-        emitStatus(testId, 'error', `BackstopJS ${command} process timed out`);
-        logMessage(testId, `BackstopJS ${command} process timed out`, 'error');
-        emitError(testId, `${command} process timed out`);
-    }, 300000); // 5 minutes timeout
-    
-    childProcess.on('close', () => {
-        clearTimeout(timeout);
+
+    childProcess.on('error', (error) => {
+        console.error(`[${testId}] BackstopJS process error:`, error);
+        logMessage(testId, `Process error: ${error.message}`, 'error');
+        onComplete(1, stdout, error.message);
     });
-    
+
     return childProcess;
 }
 
@@ -542,7 +693,8 @@ function runBackstopCommand(command, configPath, testId, onComplete) {
 async function fetchAllRoutes(url, testId) {
     let browser = null;
     try {
-        const baseUrl = url.replace(/\/$/, '');
+        // Normalize the base URL to prevent double slashes
+        const baseUrl = url.replace(/\/+$/, ''); // Remove trailing slashes
         const baseUrlObj = new URL(baseUrl);
         const foundRoutes = new Set(['/']);
         const visited = new Set();
@@ -571,7 +723,10 @@ async function fetchAllRoutes(url, testId) {
             
             let page = null;
             try {
-                const fullUrl = baseUrl + currentPath;
+                // Normalize the URL to prevent double slashes
+                const normalizedPath = currentPath.replace(/\/+/g, '/');
+                const fullUrl = baseUrl + normalizedPath;
+                
                 emitStatus(testId, 'crawling', `Analyzing page: ${fullUrl}`);
                 logMessage(testId, `Crawling (${pageCount}/${MAX_PAGES}): ${fullUrl}`);
                 
@@ -595,8 +750,14 @@ async function fetchAllRoutes(url, testId) {
                         
                         if (linkUrl.hostname !== baseUrlObj.hostname) continue;
                         
-                        let pathname = linkUrl.pathname;
+                        // Normalize pathname to prevent double slashes
+                        let pathname = linkUrl.pathname.replace(/\/+/g, '/');
                         if (!pathname.startsWith('/')) pathname = '/' + pathname;
+                        
+                        // Remove trailing slash except for root
+                        if (pathname !== '/' && pathname.endsWith('/')) {
+                            pathname = pathname.slice(0, -1);
+                        }
                         
                         if (pathname.match(/\.(jpg|jpeg|png|gif|css|js|ico|xml|pdf|doc|docx|txt)$/i)) continue;
                         if (visited.has(pathname) || foundRoutes.has(pathname)) continue;
@@ -646,25 +807,32 @@ async function fetchAllRoutes(url, testId) {
 
 // Generate BackstopJS config
 function generateBackstopConfig(prodUrl, stagingUrl, routes, testEnv) {
-    const cleanProdUrl = prodUrl.replace(/\/$/, '');
-    const cleanStagingUrl = stagingUrl.replace(/\/$/, '');
-
-    const scenarios = routes.map(route => ({
-        label: route === '/' ? 'home' : route.replace(/[^a-zA-Z0-9]/g, '_'),
-        url: cleanProdUrl + route,
-        referenceUrl: cleanStagingUrl + route,
-        selectors: ["document"],
-        misMatchThreshold: 0.1,
-        requireSameDimensions: true,
-        waitForSelector: 'body',
-        delay: 2000, // Reduced from 3000
-        postInteractionWait: 1000, // Reduced from 2000
-        // Add navigation timeout settings
-        navigationTimeout: 90000, // 90 seconds
-        loadTimeout: 90000, // 90 seconds
-        // Add retry settings
-        retry: 2
-    }));
+    const scenarios = [];
+    
+    // Normalize base URLs to prevent double slashes
+    const normalizedProdUrl = prodUrl.replace(/\/+$/, ''); // Remove trailing slashes
+    const normalizedStagingUrl = stagingUrl.replace(/\/+$/, ''); // Remove trailing slashes
+    
+    routes.forEach((route, index) => {
+        // Ensure route starts with /
+        const normalizedRoute = route.startsWith('/') ? route : `/${route}`;
+        
+        // Construct URLs properly to avoid double slashes
+        const fullProdUrl = normalizedProdUrl + normalizedRoute;
+        const fullStagingUrl = normalizedStagingUrl + normalizedRoute;
+        
+        scenarios.push({
+            label: `Route_${index + 1}_${route.replace(/[^a-zA-Z0-9]/g, '_')}`,
+            url: fullStagingUrl,
+            referenceUrl: fullProdUrl,
+            selectors: ["document"],
+            misMatchThreshold: 0.1,
+            requireSameDimensions: true,
+            waitForSelector: 'body',
+            delay: 3000,
+            postInteractionWait: 1000
+        });
+    });
 
     return {
         id: `visual_regression_test_${testEnv.testId}`,
